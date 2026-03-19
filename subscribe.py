@@ -2,13 +2,17 @@
 """
 Alibaba Cloud Lite Plan Auto-Subscriber
 매일 GMT+8 00:00에 구독 슬롯이 열릴 때 자동으로 구독을 시도합니다.
+
+실행 순서:
+  1. python save_session.py  → 브라우저에서 직접 로그인 + 핸드폰 인증
+  2. python subscribe.py     → 저장된 세션으로 자동 구독 대기
 """
 
 import asyncio
 import logging
 import os
-import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, Browser
 
@@ -19,7 +23,10 @@ TARGET_URL = (
     "&accounttraceid=7541db89e8c642a886ef5f025c799a41wjte"
 )
 
-# 환경 변수 또는 직접 입력
+# save_session.py 가 저장한 세션 파일 경로
+SESSION_FILE = "session.json"
+
+# 세션 파일이 없을 경우 폴백용 환경 변수
 ALIBABA_USERNAME = os.environ.get("ALIBABA_USERNAME", "")
 ALIBABA_PASSWORD = os.environ.get("ALIBABA_PASSWORD", "")
 
@@ -151,30 +158,58 @@ async def try_subscribe(page: Page) -> bool:
 
 
 async def wait_and_subscribe() -> None:
-    """메인 로직: 대기 → 로그인 → 구독 시도."""
-    if not ALIBABA_USERNAME or not ALIBABA_PASSWORD:
-        log.error(
-            "환경 변수를 설정해주세요:\n"
-            "  export ALIBABA_USERNAME='your_account'\n"
-            "  export ALIBABA_PASSWORD='your_password'"
-        )
-        return
+    """메인 로직: 세션 로드(또는 로그인) → 대기 → 구독 시도."""
+    use_session = Path(SESSION_FILE).exists()
+
+    if use_session:
+        log.info(f"저장된 세션을 사용합니다: {SESSION_FILE}")
+    else:
+        log.warning(f"{SESSION_FILE} 파일이 없습니다. 먼저 save_session.py를 실행하세요.")
+        if not ALIBABA_USERNAME or not ALIBABA_PASSWORD:
+            log.error(
+                "세션 파일도 없고 환경 변수도 없습니다.\n"
+                "  python save_session.py  를 먼저 실행하거나\n"
+                "  export ALIBABA_USERNAME='your_account'\n"
+                "  export ALIBABA_PASSWORD='your_password'  를 설정하세요."
+            )
+            return
 
     async with async_playwright() as pw:
-        # 브라우저 실행 (headless=False 로 설정하여 진행 상황 확인 가능)
         browser: Browser = await pw.chromium.launch(
             headless=False,
             args=["--start-maximized"],
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
+        # 세션 파일이 있으면 저장된 쿠키/스토리지로 컨텍스트 생성
+        if use_session:
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                storage_state=SESSION_FILE,
+            )
+        else:
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
         page = await context.new_page()
 
         try:
-            # 1. 로그인
-            await login(page)
+            # 1. 로그인 (세션 없을 때만)
+            if not use_session:
+                await login(page)
+            else:
+                # 세션이 실제로 유효한지 확인
+                log.info("세션 유효성 확인 중...")
+                await page.goto("https://home-intl.console.aliyun.com/", wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+                if "login" in page.url:
+                    log.error(
+                        "세션이 만료되었습니다!\n"
+                        "'python save_session.py' 를 다시 실행하여 재로그인해주세요."
+                    )
+                    await browser.close()
+                    return
+                log.info("세션 유효 확인 완료! 로그인 과정을 건너뜁니다.")
 
             # 2. 갱신 시각까지 대기
             secs = seconds_until_next_renewal()
