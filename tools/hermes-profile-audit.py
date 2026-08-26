@@ -25,6 +25,17 @@ Under `gateway.multiplex_profiles: true` that profile's secret scope is
 authoritative (agent/secret_scope.py), so it cannot fall back to the shell
 environment or to the root ~/.hermes/.env — and the profile silently does
 nothing. This script makes that state visible.
+
+OAuth setups fail differently. Hermes keeps a SINGLE install-wide Nous OAuth
+store at <root>/shared/nous_auth.json with no account identity attached
+(hermes_cli/auth.py::_merge_shared_nous_oauth_state). Every Nous token
+resolution merges that store over the profile's own tokens whenever its
+refresh token differs, so profiles configured with DIFFERENT Nous accounts
+converge onto whichever account refreshed last; the losers replay a rotated
+single-use refresh token and die with invalid_grant / refresh_token_reused.
+This script decodes each profile's OAuth access token (locally, no network,
+no token ever printed) and reports the account identity behind it, so an
+account collision is visible at a glance.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ import os
 import re
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +62,115 @@ CRED_HINTS = (
 
 # Env keys that on their own let the "auto" provider path resolve.
 GENERIC_INFERENCE_KEYS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# OAuth inspection
+# ---------------------------------------------------------------------------
+
+# Claims worth showing. Everything else in the payload is ignored so a token
+# body can never be dumped wholesale.
+IDENTITY_CLAIMS = ("sub", "email", "preferred_username", "name", "org_id",
+                   "organization_id", "account_id", "user_id", "azp", "iss")
+
+OAUTH_FIELDS = ("access_token", "refresh_token", "id_token", "expires_at",
+                "obtained_at", "auth_type", "portal_base_url")
+
+
+def decode_jwt_claims(token: str) -> dict[str, Any] | None:
+    """Decode a JWT payload locally. No signature check, no network."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        import base64
+
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def identity_of(state: dict[str, Any]) -> dict[str, Any]:
+    """Summarize one OAuth credential: whose account, when it expires."""
+    out: dict[str, Any] = {}
+    access = state.get("access_token")
+    refresh = state.get("refresh_token")
+
+    out["has_access_token"] = bool(access)
+    out["has_refresh_token"] = bool(refresh)
+    out["access_fp"] = fingerprint(access) if isinstance(access, str) and access else None
+    out["refresh_fp"] = fingerprint(refresh) if isinstance(refresh, str) and refresh else None
+
+    claims = decode_jwt_claims(access) if isinstance(access, str) else None
+    if claims:
+        out["identity"] = {k: claims[k] for k in IDENTITY_CLAIMS if k in claims}
+        exp = claims.get("exp")
+        if isinstance(exp, (int, float)):
+            out["exp_epoch"] = int(exp)
+            out["expired"] = exp < time.time()
+    if "expired" not in out and state.get("expires_at"):
+        parsed = parse_iso(str(state["expires_at"]))
+        if parsed is not None:
+            out["exp_epoch"] = int(parsed)
+            out["expired"] = parsed < time.time()
+    out["expires_at"] = state.get("expires_at")
+    out["last_status"] = state.get("last_status")
+    out["last_error_code"] = state.get("last_error_code")
+    return out
+
+
+def parse_iso(value: str) -> float | None:
+    try:
+        from datetime import datetime
+
+        text = value.strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return None
+
+
+def collect_oauth(auth: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Return {provider: [credential summary, ...]} from an auth.json dict."""
+    found: dict[str, list[dict[str, Any]]] = {}
+
+    providers = auth.get("providers")
+    if isinstance(providers, dict):
+        for name, state in providers.items():
+            if not isinstance(state, dict):
+                continue
+            if not any(state.get(f) for f in ("access_token", "refresh_token")):
+                continue
+            summary = identity_of(state)
+            summary["slot"] = "providers"
+            found.setdefault(name, []).append(summary)
+
+    pool = auth.get("credential_pool")
+    if isinstance(pool, dict):
+        for name, entries in pool.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if not any(entry.get(f) for f in ("access_token", "refresh_token")):
+                    continue
+                summary = identity_of(entry)
+                summary["slot"] = f"credential_pool[{entry.get('id') or '?'}]"
+                found.setdefault(name, []).append(summary)
+
+    return found
+
+
+def describe_identity(summary: dict[str, Any]) -> str:
+    """One-line, secret-free description of whose account a credential is."""
+    ident = summary.get("identity") or {}
+    who = (ident.get("email") or ident.get("preferred_username")
+           or ident.get("sub") or ident.get("account_id") or ident.get("user_id"))
+    if not who:
+        return "account unknown (token is not a JWT or carries no identity claim)"
+    return str(who)
 
 
 def fingerprint(value: str) -> str:
@@ -183,6 +304,7 @@ def inspect_profile(name: str, home: Path, *, is_default: bool) -> dict[str, Any
     auth = read_json(home / "auth.json")
     providers = auth.get("providers")
     provider_names = sorted(providers.keys()) if isinstance(providers, dict) else []
+    oauth = collect_oauth(auth)
 
     cfg = read_yaml(home / "config.yaml")
     model, provider = model_config(cfg)
@@ -211,16 +333,39 @@ def inspect_profile(name: str, home: Path, *, is_default: bool) -> dict[str, Any
         "auth_exists": (home / "auth.json").is_file(),
         "auth_providers": provider_names,
         "active_provider": auth.get("active_provider"),
+        "oauth": oauth,
         "config_exists": (home / "config.yaml").is_file(),
         "model": model,
         "config_provider": provider,
     }
 
 
+def inspect_shared_nous(root: Path) -> dict[str, Any] | None:
+    """Inspect <root>/shared/nous_auth.json — the install-wide Nous OAuth slot.
+
+    Honors HERMES_SHARED_AUTH_DIR, the same override auth.py reads.
+    """
+    override = os.environ.get("HERMES_SHARED_AUTH_DIR", "").strip()
+    base = Path(override).expanduser() if override else root / "shared"
+    path = base / "nous_auth.json"
+    if not path.is_file():
+        return None
+    state = read_json(path)
+    if not state:
+        return None
+    summary = identity_of(state)
+    summary["path"] = str(path)
+    summary["updated_at"] = state.get("updated_at")
+    summary["overridden"] = bool(override)
+    return summary
+
+
 def verdict(p: dict[str, Any], *, multiplex: bool, global_auth: dict[str, Any],
-            served: bool) -> list[str]:
-    """Return the reasons this profile cannot resolve an account, if any."""
+            served: bool) -> tuple[list[str], list[str]]:
+    """Return (blocking problems, non-blocking notes) for one profile."""
     problems: list[str] = []
+    notes: list[str] = []
+    has_oauth = bool(p.get("oauth"))
 
     if not p["valid_id"]:
         problems.append(
@@ -268,24 +413,122 @@ def verdict(p: dict[str, Any], *, multiplex: bool, global_auth: dict[str, Any],
                 "active_provider is set — resolution order may pick the wrong one"
             )
 
-    if multiplex and not p["is_default"]:
-        if not p["env_exists"]:
-            problems.append(
-                "no .env: under gateway.multiplex_profiles the secret scope is "
-                "authoritative, so this profile sees no credentials at all"
+    if multiplex and not p["is_default"] and not has_env_cred:
+        # auth.json (OAuth) is NOT gated by the secret scope, so a profile
+        # authenticated via OAuth still resolves a model without any .env key.
+        # Platform bot tokens have no such fallback — they are .env only.
+        if has_oauth:
+            notes.append(
+                "no credential key in .env — fine for OAuth inference, but under "
+                "gateway.multiplex_profiles any platform bot token "
+                "(TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, ...) must live in THIS "
+                "profile's .env; the root .env and shell exports are not visible"
             )
-        elif not has_env_cred:
+        elif not p["env_exists"]:
             problems.append(
-                "`.env` exists but defines no credential key. Under "
-                "gateway.multiplex_profiles the secret scope is authoritative — "
-                "the shell environment and the root ~/.hermes/.env are NOT visible "
-                "to this profile"
+                "no .env and no OAuth credential: under gateway.multiplex_profiles "
+                "the secret scope is authoritative, so this profile sees no "
+                "credentials at all"
+            )
+        else:
+            problems.append(
+                "`.env` defines no credential key and auth.json holds no OAuth "
+                "credential. Under gateway.multiplex_profiles the secret scope is "
+                "authoritative — the shell environment and the root ~/.hermes/.env "
+                "are NOT visible to this profile"
             )
 
     if p["env_exists"] and p["env_mode"] not in (None, "0600"):
         problems.append(f".env mode is {p['env_mode']} (expected 0600)")
 
-    return problems
+    for provider, creds in (p.get("oauth") or {}).items():
+        for cred in creds:
+            if cred.get("expired") and not cred.get("has_refresh_token"):
+                problems.append(
+                    f"{provider} OAuth access token is expired and the entry has "
+                    f"no refresh token — re-login required"
+                )
+            if cred.get("last_status") in ("dead", "DEAD"):
+                problems.append(
+                    f"{provider} OAuth credential is marked DEAD"
+                    + (f" ({cred['last_error_code']})" if cred.get("last_error_code") else "")
+                )
+            elif cred.get("last_error_code") in (
+                "invalid_grant", "invalid_token", "refresh_token_reused",
+            ):
+                problems.append(
+                    f"{provider} OAuth credential last failed with "
+                    f"{cred['last_error_code']} — its refresh token was consumed "
+                    f"elsewhere (single-use rotation)"
+                )
+
+    return problems, notes
+
+
+def oauth_collisions(report: list[dict[str, Any]],
+                     shared: dict[str, Any] | None) -> list[str]:
+    """Flag profiles that ended up bound to the same OAuth account/token.
+
+    Two profiles carrying the same refresh-token fingerprint are racing on a
+    single-use token: whichever refreshes first invalidates the other. Two
+    profiles resolving to the same account identity means the per-profile
+    account separation the user configured has already collapsed.
+    """
+    findings: list[str] = []
+    by_refresh: dict[tuple[str, str], list[str]] = {}
+    by_identity: dict[tuple[str, str], list[str]] = {}
+
+    for p in report:
+        for provider, creds in (p.get("oauth") or {}).items():
+            for cred in creds:
+                if cred.get("refresh_fp"):
+                    by_refresh.setdefault((provider, cred["refresh_fp"]), []).append(p["name"])
+                who = describe_identity(cred)
+                if not who.startswith("account unknown"):
+                    by_identity.setdefault((provider, who), []).append(p["name"])
+
+    for (provider, fp), names in sorted(by_refresh.items()):
+        unique = sorted(set(names))
+        if len(unique) > 1:
+            findings.append(
+                f"{provider}: profiles {', '.join(unique)} hold the SAME refresh "
+                f"token (fp {fp}). Refresh tokens are single-use — the first "
+                f"profile to refresh invalidates it for the others."
+            )
+
+    for (provider, who), names in sorted(by_identity.items()):
+        unique = sorted(set(names))
+        if len(unique) > 1:
+            findings.append(
+                f"{provider}: profiles {', '.join(unique)} all resolve to account "
+                f"{who!r}. Per-profile account separation has collapsed."
+            )
+
+    if shared and shared.get("refresh_fp"):
+        owners = sorted({
+            p["name"]
+            for p in report
+            for creds in (p.get("oauth") or {}).values()
+            for cred in creds
+            if cred.get("refresh_fp") == shared["refresh_fp"]
+        })
+        others = sorted({
+            p["name"] for p in report if "nous" in (p.get("oauth") or {})
+        })
+        if owners:
+            findings.append(
+                f"shared/nous_auth.json currently holds the token of: "
+                f"{', '.join(owners)} (account {describe_identity(shared)}). Every "
+                f"other Nous profile merges this token over its own on the next "
+                f"refresh (auth.py::_merge_shared_nous_oauth_state)."
+            )
+        elif others:
+            findings.append(
+                f"shared/nous_auth.json holds a token ({describe_identity(shared)}) "
+                f"that matches NO profile's stored credential — it will be merged "
+                f"into whichever Nous profile refreshes next, overwriting its account."
+            )
+    return findings
 
 
 def main() -> int:
@@ -310,6 +553,7 @@ def main() -> int:
     default_cfg = read_yaml(root / "config.yaml")
     gw = gateway_flags(default_cfg)
     global_auth = read_json(root / "auth.json")
+    shared_nous = inspect_shared_nous(root)
 
     entries: list[tuple[str, Path, bool]] = [("default", root, True)]
     profiles_root = root / "profiles"
@@ -324,15 +568,19 @@ def main() -> int:
         info = inspect_profile(name, home, is_default=is_default)
         served = is_default or allowlist is None or name in allowlist
         info["served_by_gateway"] = served
-        info["problems"] = verdict(info, multiplex=gw["multiplex_profiles"],
-                                   global_auth=global_auth, served=served)
+        info["problems"], info["notes"] = verdict(
+            info, multiplex=gw["multiplex_profiles"],
+            global_auth=global_auth, served=served)
         report.append(info)
+
+    collisions = oauth_collisions(report, shared_nous)
 
     if args.json:
         print(json.dumps({"root": str(root), "active_profile": active,
-                          "gateway": gw, "profiles": report}, indent=2,
-                         ensure_ascii=False))
-        return 0
+                          "gateway": gw, "shared_nous_store": shared_nous,
+                          "oauth_collisions": collisions, "profiles": report},
+                         indent=2, ensure_ascii=False))
+        return 0 if not (collisions or any(p["problems"] for p in report)) else 1
 
     print(f"\nHermes root        : {root}")
     print(f"Active profile     : {active}")
@@ -340,6 +588,16 @@ def main() -> int:
           + (f"  (env override: {gw['env_override']})" if gw["env_override"] else ""))
     print(f"profile allowlist  : {allowlist if allowlist is not None else '(none — all profiles served)'}")
     print(f"profile_routes     : {len(gw['profile_routes'])} route(s)")
+    if shared_nous:
+        state = "EXPIRED" if shared_nous.get("expired") else "valid"
+        print(f"shared Nous store  : {shared_nous['path']}")
+        print(f"                     account={describe_identity(shared_nous)} "
+              f"refresh_fp={shared_nous['refresh_fp']} access={state} "
+              f"updated={shared_nous.get('updated_at') or 'unknown'}")
+        if shared_nous.get("overridden"):
+            print("                     (HERMES_SHARED_AUTH_DIR override in effect)")
+    else:
+        print("shared Nous store  : absent")
 
     for p in report:
         label = p["name"] + (f"  [{p['display_name']}]" if p["display_name"] else "")
@@ -357,6 +615,17 @@ def main() -> int:
               + ("missing" if not p["auth_exists"]
                  else f"providers={p['auth_providers'] or '[]'}, "
                       f"active_provider={p['active_provider'] or 'unset'}"))
+        for provider, creds in sorted((p.get("oauth") or {}).items()):
+            for cred in creds:
+                state = "EXPIRED" if cred.get("expired") else "valid"
+                print(f"  oauth[{provider}]".ljust(18) + ": "
+                      f"account={describe_identity(cred)}")
+                print(f"      slot={cred['slot']} access={state} "
+                      f"access_fp={cred['access_fp']} "
+                      f"refresh_fp={cred['refresh_fp'] or 'none'}")
+                if cred.get("last_error_code"):
+                    print(f"      last_error={cred['last_error_code']} "
+                          f"status={cred.get('last_status')}")
         print(f"  config.yaml     : "
               + ("missing" if not p["config_exists"]
                  else f"model={p['model'] or 'unset'}, "
@@ -368,19 +637,36 @@ def main() -> int:
                 print(f"      ! {problem}")
         else:
             print("  VERDICT         : account wiring looks complete")
+        for note in p.get("notes") or []:
+            print(f"      - note: {note}")
 
     broken = [p["name"] for p in report if p["problems"]]
     print(f"\n{'=' * 68}")
+    if collisions:
+        print("OAuth account collisions:")
+        for finding in collisions:
+            print(f"  ! {finding}")
+        print()
     if broken:
         print(f"{len(broken)} profile(s) with problems: {', '.join(broken)}")
-        print("\nMost common fix — copy the working profile's credentials:")
-        print("    cp ~/.hermes/profiles/<working>/.env ~/.hermes/profiles/<broken>/.env")
-        print("    chmod 600 ~/.hermes/profiles/<broken>/.env")
-        print("  or recreate the profile with its credentials cloned:")
-        print("    hermes profile create <name> --clone-from <working>")
-    else:
+        if any("`.env`" in problem or "no .env" in problem
+               for p in report for problem in p["problems"]):
+            print("\nFor the .env findings — copy the working profile's credentials:")
+            print("    cp ~/.hermes/profiles/<working>/.env ~/.hermes/profiles/<broken>/.env")
+            print("    chmod 600 ~/.hermes/profiles/<broken>/.env")
+            print("  or recreate the profile with its credentials cloned:")
+            print("    hermes profile create <name> --clone-from <working>")
+    elif not collisions:
         print("All profiles have complete account wiring.")
-    return 1 if broken else 0
+
+    if collisions:
+        print("\nPer-profile OAuth accounts on one install are not isolated by")
+        print("default. To keep them apart, give each profile its own shared store:")
+        print("    HERMES_SHARED_AUTH_DIR=~/.hermes/profiles/<name>/shared \\")
+        print("        hermes -p <name> auth login <provider>")
+        print("and export the same value for that profile's gateway/CLI processes.")
+        print("Then re-login each affected profile so it gets its own token chain.")
+    return 1 if (broken or collisions) else 0
 
 
 if __name__ == "__main__":
