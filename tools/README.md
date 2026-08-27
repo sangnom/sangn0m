@@ -116,6 +116,35 @@ hermes -p coder3 auth login nous      # 이 프로필 전용 토큰 체인 발�
 토큰을 회전시키고 그 결과를 루트 스토어에 다시 쓰기 때문이다
 (`_save_provider_state_to_source`).
 
+## "토큰 한도 도달"이 나오는데 실제로는 한도가 남아 있을 때
+
+두 가지가 각각 이 증상을 만든다.
+
+**1. 계정이 바뀌어 있다.** Hermes가 표시하는 계정·요금제·한도는 전부 그 프로필
+`auth.json`에 저장된 access token의 JWT claim에서 읽는다
+(`hermes_cli/nous_account.py::_info_from_valid_jwt` — `sub`, `email`,
+`paid_access`, `subscription_tier`). 위의 공유 스토어 병합으로 남의 토큰이
+들어와 있으면, 표시되는 한도도 **남의 계정 한도**다. 포털에서 본 잔여 한도와
+Hermes가 말하는 한도가 다른 이유가 이것이다.
+
+    python3 tools/hermes-profile-audit.py --expect coder3=you@example.com
+
+`--expect`를 주면 저장된 토큰의 계정과 대조해서 다르면 WRONG ACCOUNT로 잡는다.
+
+**2. 소진 상태가 캐시돼 있다.** 429/403을 한 번 받으면 그 자격증명은
+`last_status=exhausted` + `last_error_reset_at`으로 벤치에 앉는다
+(`agent/credential_pool.py::_mark_exhausted`). 이 reset 시각은 **그때 서버가
+보낸 값**이고, 이후 한도가 실제로 회복돼도 Hermes는 그 시각까지 다시 시도하지
+않는다(`_exhausted_until`). 기본 대기는 429에 1시간, 그 외 1시간, 401에 5분
+(`EXHAUSTED_TTL_*`).
+
+    hermes -p coder3 auth reset nous     # 소진 표시만 지운다 (재로그인 아님)
+    hermes -p coder3 auth status nous
+    hermes -p coder3 auth list nous
+
+스크립트는 남은 대기 시간을 분 단위로 찍고, 이미 지난 경우 "expired"로 표시한다.
+
+
 ## 고치는 법
 
 ```bash

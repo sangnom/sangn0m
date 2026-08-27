@@ -73,6 +73,13 @@ GENERIC_INFERENCE_KEYS = ("OPENAI_API_KEY", "OPENROUTER_API_KEY")
 IDENTITY_CLAIMS = ("sub", "email", "preferred_username", "name", "org_id",
                    "organization_id", "account_id", "user_id", "azp", "iss")
 
+# Entitlement claims Hermes itself reads to decide whether an account may use
+# paid inference (hermes_cli/nous_account.py::_info_from_valid_jwt). When these
+# disagree with what the portal shows in a browser, the stored token is stale
+# or belongs to a different account than the one you think is connected.
+ENTITLEMENT_CLAIMS = ("paid_access", "subscription_tier", "product_id",
+                      "nous_client", "tool_access", "scope")
+
 OAUTH_FIELDS = ("access_token", "refresh_token", "id_token", "expires_at",
                 "obtained_at", "auth_type", "portal_base_url")
 
@@ -106,6 +113,9 @@ def identity_of(state: dict[str, Any]) -> dict[str, Any]:
     claims = decode_jwt_claims(access) if isinstance(access, str) else None
     if claims:
         out["identity"] = {k: claims[k] for k in IDENTITY_CLAIMS if k in claims}
+        entitlement = {k: claims[k] for k in ENTITLEMENT_CLAIMS if k in claims}
+        if entitlement:
+            out["entitlement"] = entitlement
         exp = claims.get("exp")
         if isinstance(exp, (int, float)):
             out["exp_epoch"] = int(exp)
@@ -118,6 +128,18 @@ def identity_of(state: dict[str, Any]) -> dict[str, Any]:
     out["expires_at"] = state.get("expires_at")
     out["last_status"] = state.get("last_status")
     out["last_error_code"] = state.get("last_error_code")
+    out["last_error_reason"] = state.get("last_error_reason")
+    out["last_error_message"] = state.get("last_error_message")
+
+    # A quota failure benches the credential until last_error_reset_at, a
+    # timestamp the SERVER supplied. Hermes will not retry before then even if
+    # the quota has already refilled (agent/credential_pool.py::_exhausted_until).
+    reset_at = state.get("last_error_reset_at")
+    if reset_at is not None:
+        epoch = reset_at if isinstance(reset_at, (int, float)) else parse_iso(str(reset_at))
+        if epoch is not None:
+            out["cooldown_until_epoch"] = int(epoch)
+            out["cooldown_remaining_s"] = int(epoch - time.time())
     return out
 
 
@@ -361,7 +383,8 @@ def inspect_shared_nous(root: Path) -> dict[str, Any] | None:
 
 
 def verdict(p: dict[str, Any], *, multiplex: bool, global_auth: dict[str, Any],
-            served: bool) -> tuple[list[str], list[str]]:
+            served: bool, expected_account: str | None = None
+            ) -> tuple[list[str], list[str]]:
     """Return (blocking problems, non-blocking notes) for one profile."""
     problems: list[str] = []
     notes: list[str] = []
@@ -388,9 +411,16 @@ def verdict(p: dict[str, Any], *, multiplex: bool, global_auth: dict[str, Any],
 
     # Per-provider auth.json entries fall back to the global root store
     # (auth.py::_load_provider_state). `active_provider` does NOT.
-    reachable_providers = set(p["auth_providers"]) | (
-        set() if p["is_default"] else global_provider_names
+    global_pool = global_auth.get("credential_pool")
+    global_pool_names = (
+        set(global_pool.keys()) if isinstance(global_pool, dict) else set()
     )
+    # A provider is reachable from this profile via its own auth.json (either
+    # the providers{} singleton or a credential_pool entry) or, for a named
+    # profile, via the root store's per-provider fallback.
+    reachable_providers = set(p["auth_providers"]) | set(p.get("oauth") or {})
+    if not p["is_default"]:
+        reachable_providers |= global_provider_names | global_pool_names
 
     cfg_provider = (p["config_provider"] or "").strip().lower()
     if cfg_provider:
@@ -453,7 +483,37 @@ def verdict(p: dict[str, Any], *, multiplex: bool, global_auth: dict[str, Any],
                     f"{provider} OAuth credential is marked DEAD"
                     + (f" ({cred['last_error_code']})" if cred.get("last_error_code") else "")
                 )
-            elif cred.get("last_error_code") in (
+            remaining = cred.get("cooldown_remaining_s")
+            if cred.get("last_status") in ("exhausted", "EXHAUSTED"):
+                if isinstance(remaining, int) and remaining > 0:
+                    problems.append(
+                        f"{provider} credential is benched as OUT OF QUOTA for "
+                        f"another {remaining // 60}m {remaining % 60}s. Hermes will "
+                        f"refuse to use it until then even if the quota has already "
+                        f"refilled — the reset time came from the server response, "
+                        f"not from a live check. Clear it with: "
+                        f"hermes -p {p['name']} auth reset {provider}"
+                    )
+                else:
+                    notes.append(
+                        f"{provider} credential was benched as out of quota, but the "
+                        f"cooldown has expired — it re-enters rotation on the next call"
+                    )
+            if expected_account:
+                who = describe_identity(cred)
+                if who.startswith("account unknown"):
+                    notes.append(
+                        f"{provider} token carries no identity claim, so the expected "
+                        f"account {expected_account!r} cannot be verified from disk"
+                    )
+                elif expected_account.lower() not in who.lower():
+                    problems.append(
+                        f"WRONG ACCOUNT: you expect {provider} here to be "
+                        f"{expected_account!r}, but the stored token belongs to "
+                        f"{who!r}. Any quota or limit Hermes reports for this profile "
+                        f"is {who}'s, not {expected_account}'s."
+                    )
+            if cred.get("last_error_code") in (
                 "invalid_grant", "invalid_token", "refresh_token_reused",
             ):
                 problems.append(
@@ -537,7 +597,19 @@ def main() -> int:
     ap.add_argument("--root", default=os.environ.get("HERMES_HOME") or "~/.hermes",
                     help="Hermes root (default: $HERMES_HOME or ~/.hermes)")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    ap.add_argument("--expect", action="append", default=[], metavar="PROFILE=ACCOUNT",
+                    help="Assert which account a profile should be bound to, e.g. "
+                         "--expect coder3=someone@example.com (repeatable). "
+                         "Matched against the access token's email/sub claim.")
     args = ap.parse_args()
+
+    expected: dict[str, str] = {}
+    for item in args.expect:
+        name, sep, account = item.partition("=")
+        if not sep or not name.strip() or not account.strip():
+            print(f"error: --expect needs PROFILE=ACCOUNT, got {item!r}", file=sys.stderr)
+            return 2
+        expected[name.strip().lower()] = account.strip()
 
     root = Path(args.root).expanduser()
     # A HERMES_HOME pointing at a profile means the real root is two levels up.
@@ -568,9 +640,11 @@ def main() -> int:
         info = inspect_profile(name, home, is_default=is_default)
         served = is_default or allowlist is None or name in allowlist
         info["served_by_gateway"] = served
+        info["expected_account"] = expected.get(name.lower())
         info["problems"], info["notes"] = verdict(
             info, multiplex=gw["multiplex_profiles"],
-            global_auth=global_auth, served=served)
+            global_auth=global_auth, served=served,
+            expected_account=info["expected_account"])
         report.append(info)
 
     collisions = oauth_collisions(report, shared_nous)
@@ -623,14 +697,30 @@ def main() -> int:
                 print(f"      slot={cred['slot']} access={state} "
                       f"access_fp={cred['access_fp']} "
                       f"refresh_fp={cred['refresh_fp'] or 'none'}")
-                if cred.get("last_error_code"):
-                    print(f"      last_error={cred['last_error_code']} "
-                          f"status={cred.get('last_status')}")
+                if cred.get("entitlement"):
+                    fields = " ".join(f"{k}={v}" for k, v in cred["entitlement"].items())
+                    print(f"      entitlement: {fields}")
+                if cred.get("last_error_code") or cred.get("last_status"):
+                    print(f"      last_error={cred.get('last_error_code')} "
+                          f"status={cred.get('last_status')} "
+                          f"reason={cred.get('last_error_reason')}")
+                remaining = cred.get("cooldown_remaining_s")
+                if isinstance(remaining, int):
+                    if remaining > 0:
+                        print(f"      quota cooldown: {remaining // 60}m "
+                              f"{remaining % 60}s remaining (server-supplied)")
+                    else:
+                        print(f"      quota cooldown: expired "
+                              f"{abs(remaining) // 60}m ago")
+                if cred.get("last_error_message"):
+                    print(f"      server said: {cred['last_error_message'][:160]}")
         print(f"  config.yaml     : "
               + ("missing" if not p["config_exists"]
                  else f"model={p['model'] or 'unset'}, "
                       f"provider={p['config_provider'] or 'unset'}"))
         print(f"  served by gw    : {p['served_by_gateway']}")
+        if p.get("expected_account"):
+            print(f"  expected account: {p['expected_account']}")
         if p["problems"]:
             print("  VERDICT         : will not work")
             for problem in p["problems"]:
